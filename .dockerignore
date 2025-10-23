@@ -1,0 +1,14 @@
+.git
+.gitignore
+node_modules
+dist
+build
+target
+.venv
+*.log
+*.tmp
+**/.DS_Store
+.env
+secrets/*
+out
+bin
