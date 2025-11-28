@@ -1,24 +1,100 @@
 package main
+
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
+
+	"github.com/docker/docker/client"
 )
 
-type finding struct{
+type finding struct {
 	line int
-	msg string
+	msg  string
 }
 
-//Starting point
-func main(){
-	dfPath := flag.String("dockerfile", "Dockerfile", "Path to the Dockerfile")
+func AnalyzeImageLayers(imageName string) error {
+	ctx := context.Background()
 
+	cli, err := client.NewClientWithOpts(
+		client.FromEnv,
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+
+	history, err := cli.ImageHistory(ctx, imageName)
+	if err != nil {
+		return err
+	}
+
+	if len(history) == 0 {
+		fmt.Printf("No layers found for image %s\n", imageName)
+		return nil
+	}
+
+	// Build sortable slice by layer size.
+	type layerInfo struct {
+		index int
+		size  int64
+	}
+
+	layers := make([]layerInfo, 0, len(history))
+	for i, h := range history {
+		layers = append(layers, layerInfo{
+			index: i,
+			size:  h.Size,
+		})
+	}
+
+	// Sort by size descending.
+	sort.Slice(layers, func(i, j int) bool {
+		return layers[i].size > layers[j].size
+	})
+
+	topN := 3
+	if len(layers) < topN {
+		topN = len(layers)
+	}
+
+	fmt.Printf("\nTop %d layers by size for image %s:\n\n", topN, imageName)
+
+	for rank := 0; rank < topN; rank++ {
+		li := layers[rank]
+		h := history[li.index]
+
+		// history is newest to oldest; original code used len(history)-i-1 as "Layer #"
+		layerNumber := len(history) - li.index - 1
+		created := time.Unix(h.Created, 0)
+
+		fmt.Printf("Rank #%d (Layer #%d)\n", rank+1, layerNumber)
+		fmt.Printf("  ID:        %s\n", h.ID)
+		fmt.Printf("  Created:   %s\n", created.Format(time.RFC3339))
+		fmt.Printf("  Size:      %.2f MB\n", float64(h.Size)/(1024*1024))
+		fmt.Printf("  CreatedBy: %s\n", h.CreatedBy)
+		if h.Comment != "" {
+			fmt.Printf("  Comment:   %s\n", h.Comment)
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
+// Starting point
+func main() {
+	dfPath := flag.String("dockerfile", "Dockerfile", "Path to the Dockerfile")
 	strict := flag.Bool("strict", false, "Exit with non-zero status if any suggestions are found (useful in CI)")
+	imageName := flag.String("image", "", "Docker image name to analyze layers (optional)")
 
 	flag.Parse()
 
@@ -31,68 +107,72 @@ func main(){
 
 	findings = append(findings, checkDotDockerignore(*dfPath)...)
 
-		if len(findings) == 0 {
+	if len(findings) == 0 {
 		fmt.Println("No suggestions  (Nice Dockerfile!)")
-		return
-	}
-
-	fmt.Println("Suggestions:")
-	for _, f := range findings {
-		if f.line > 0 {
-			//line-scoped suggestion.
-			fmt.Printf("  [L%d] %s\n", f.line, f.msg)
-		} else {
-			fmt.Printf("  %s\n", f.msg)
+	} else {
+		fmt.Println("Suggestions:")
+		for _, f := range findings {
+			if f.line > 0 {
+				// line-scoped suggestion.
+				fmt.Printf("  [L%d] %s\n", f.line, f.msg)
+			} else {
+				fmt.Printf("  %s\n", f.msg)
+			}
 		}
 	}
 
-	if *strict {
-		os.Exit(1)
+	// Optional: analyze image layers if an image name was provided.
+	if *imageName != "" {
+		if err := AnalyzeImageLayers(*imageName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error analyzing image layers: %v\n", err)
+		}
 	}
 
+	if *strict && len(findings) > 0 {
+		os.Exit(1)
+	}
 }
 
-
 func lintDockerfile(content string) []finding { // Lints Dockerfile content and returns suggestions.
-	var out []finding 
+	var out []finding
 
 	sc := bufio.NewScanner(strings.NewReader(content))
 	sc.Split(bufio.ScanLines) // Ensure we split by lines.
 
-	lineNo := 0               
-	haveUserNonRoot := false   
-	lastStageStartLine := 0    
-	healthcheckSeen := false   
-	exposeSeen := false        
-	cmdLooksLikeServer := false 
-	fromCount := 0             
+	lineNo := 0
+	haveUserNonRoot := false
+	lastStageStartLine := 0
+	healthcheckSeen := false
+	exposeSeen := false
+	cmdLooksLikeServer := false
+	fromCount := 0
 
-	reFrom := regexp.MustCompile(`(?i)^\s*FROM\s+([^\s:]+)(?::([^\s]+))?`)  // FROM image[:tag]
-	reAdd := regexp.MustCompile(`(?i)^\s*ADD\s+`)                           // ADD instruction (prefer COPY).
-	reCopyDot := regexp.MustCompile(`(?i)^\s*COPY\s+--?chown=\S+\s+\.\s+\.\s*$|^\s*COPY\s+\.\s+\.\s*$`) // COPY . .
-	reAptUpdate := regexp.MustCompile(`(?i)apt(-get)?\s+update`)             // apt-get update
-	reAptInstall := regexp.MustCompile(`(?i)apt(-get)?\s+install(\s|$)`)     // apt-get install
-	reNoRecommends := regexp.MustCompile(`(?i)--no-install-recommends`)      // APT flag to reduce image bloat.
-	reRmAptLists := regexp.MustCompile(`/var/lib/apt/lists/\*`)              // APT cache cleanup path.
-	rePipInstall := regexp.MustCompile(`(?i)pip(3)?\s+install(\s|$)`)        // pip install
-	reNpmInstall := regexp.MustCompile(`(?i)npm\s+install(\s|$)`)            // npm install (prefer npm ci).
-	reCurlPipeSh := regexp.MustCompile(`(?i)curl[^\|]*\|\s*(sh|bash)`)       // curl | sh
-	reWgetPipeSh := regexp.MustCompile(`(?i)wget[^\|]*\|\s*(sh|bash)`)       // wget | bash
-	reUser := regexp.MustCompile(`(?i)^\s*USER\s+(.+)$`)                     // USER <name|uid>
-	reExpose := regexp.MustCompile(`(?i)^\s*EXPOSE\s+`)                      // EXPOSE <port>...
-	reHealth := regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s+`)                 // HEALTHCHECK ...
-	reCmd := regexp.MustCompile(`(?i)^\s*CMD\s+`)                            // CMD ...
+	reFrom := regexp.MustCompile(`(?i)^\s*FROM\s+([^\s:]+)(?::([^\s]+))?`)                                 // FROM image[:tag]
+	reAdd := regexp.MustCompile(`(?i)^\s*ADD\s+`)                                                          // ADD instruction (prefer COPY).
+	reCopyDot := regexp.MustCompile(`(?i)^\s*COPY\s+--?chown=\S+\s+\.\s+\.\s*$|^\s*COPY\s+\.\s+\.\s*$`)   // COPY . .
+	reAptUpdate := regexp.MustCompile(`(?i)apt(-get)?\s+update`)                                          // apt-get update
+	reAptInstall := regexp.MustCompile(`(?i)apt(-get)?\s+install(\s|$)`)                                  // apt-get install
+	reNoRecommends := regexp.MustCompile(`(?i)--no-install-recommends`)                                   // APT flag to reduce image bloat.
+	reRmAptLists := regexp.MustCompile(`/var/lib/apt/lists/\*`)                                           // APT cache cleanup path.
+	rePipInstall := regexp.MustCompile(`(?i)pip(3)?\s+install(\s|$)`)                                     // pip install
+	reNpmInstall := regexp.MustCompile(`(?i)npm\s+install(\s|$)`)                                         // npm install (prefer npm ci).
+	reCurlPipeSh := regexp.MustCompile(`(?i)curl[^\|]*\|\s*(sh|bash)`)                                    // curl | sh
+	reWgetPipeSh := regexp.MustCompile(`(?i)wget[^\|]*\|\s*(sh|bash)`)                                    // wget | bash
+	reUser := regexp.MustCompile(`(?i)^\s*USER\s+(.+)$`)                                                  // USER <name|uid>
+	reExpose := regexp.MustCompile(`(?i)^\s*EXPOSE\s+`)                                                   // EXPOSE <port>...
+	reHealth := regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s+`)                                              // HEALTHCHECK ...
+	reCmd := regexp.MustCompile(`(?i)^\s*CMD\s+`)                                                         // CMD ...
 
 	for sc.Scan() {
-		line := sc.Text()         
-		lineNo++                 
-		withoutComments := stripTrailingComment(line) 
+		line := sc.Text()
+		lineNo++
+		withoutComments := stripTrailingComment(line)
 
 		if m := reFrom.FindStringSubmatch(withoutComments); m != nil {
-			fromCount++                     // Count this stage.
-			lastStageStartLine = lineNo     // Remember where the final stage starts.
-			image := m[1]                   // Captured base image (e.g., ubuntu).
-			tag := m[2]                     // Optional tag (may be empty if omitted).
+			fromCount++                 // Count this stage.
+			lastStageStartLine = lineNo // Remember where the final stage starts.
+			image := m[1]               // Captured base image (e.g., ubuntu).
+			tag := m[2]                 // Optional tag (may be empty if omitted).
 			if strings.EqualFold(tag, "latest") || tag == "" {
 				if tag == "" {
 					out = append(out, finding{
@@ -124,8 +204,8 @@ func lintDockerfile(content string) []finding { // Lints Dockerfile content and 
 		}
 
 		if strings.Contains(strings.ToLower(withoutComments), "apt") {
-			update := reAptUpdate.MatchString(withoutComments)  
-			install := reAptInstall.MatchString(withoutComments) 
+			update := reAptUpdate.MatchString(withoutComments)
+			install := reAptInstall.MatchString(withoutComments)
 
 			if install && !reNoRecommends.MatchString(withoutComments) {
 				out = append(out, finding{
@@ -150,7 +230,7 @@ func lintDockerfile(content string) []finding { // Lints Dockerfile content and 
 			}
 		}
 
-		// (5) pip best practice: --no-cache-dir prevents caching wheels/packages in the image.
+		// pip best practice: --no-cache-dir prevents caching wheels/packages in the image.
 		if rePipInstall.MatchString(withoutComments) && !strings.Contains(strings.ToLower(withoutComments), "--no-cache-dir") {
 			out = append(out, finding{
 				lineNo,
@@ -158,7 +238,7 @@ func lintDockerfile(content string) []finding { // Lints Dockerfile content and 
 			})
 		}
 
-		// (6) npm best practice: prefer 'npm ci' with a lockfile for reproducible installs.
+		// npm best practice: prefer 'npm ci' with a lockfile for reproducible installs.
 		if reNpmInstall.MatchString(withoutComments) && !strings.Contains(strings.ToLower(withoutComments), "ci") {
 			out = append(out, finding{
 				lineNo,
@@ -166,24 +246,24 @@ func lintDockerfile(content string) []finding { // Lints Dockerfile content and 
 			})
 		}
 
-		// (7) Supply-chain hardening: avoid piping network content into a shell.
-		if reCurlPipeSh.MatchString(withoutComments) ||reWgetPipeSh.MatchString(withoutComments) {
+		// Supply-chain hardening: avoid piping network content into a shell.
+		if reCurlPipeSh.MatchString(withoutComments) || reWgetPipeSh.MatchString(withoutComments) {
 			out = append(out, finding{
-				lineNo, 
+				lineNo,
 				"Avoid piping curl/wget to shell. Download, verify checksum/signature, then execute. This hardens against supply-chain risks.",
 			})
 		}
 
-		// (8) Non-root user detection: mark if stage sets USER to something other than root.
+		// Non-root user detection: mark if stage sets USER to something other than root.
 		if m := reUser.FindStringSubmatch(withoutComments); m != nil {
 			if strings.TrimSpace(strings.ToLower(m[1])) != "root" {
 				haveUserNonRoot = true // Final stage passes this check if it ever sets non-root.
 			}
 		}
 
-		// (9) Healthcheck heuristic: server-like images should have a HEALTHCHECK.
+		// Healthcheck heuristic: server-like images should have a HEALTHCHECK.
 		if reExpose.MatchString(withoutComments) {
-			exposeSeen = true 
+			exposeSeen = true
 		}
 		if reCmd.MatchString(withoutComments) {
 			lc := strings.ToLower(withoutComments)
@@ -262,13 +342,12 @@ func dedupeFindings(f []finding) []finding {
 	for _, x := range f {
 		key := fmt.Sprintf("%d|%s", x.line, x.msg) // Composite key.
 		if !seen[key] {
-			seen[key] = true       // Mark as seen.
-			out = append(out, x)   // Keep first occurrence.
+			seen[key] = true   // Mark as seen.
+			out = append(out, x) // Keep first occurrence.
 		}
 	}
 	return out // Return deduped slice.
 }
-
 
 // checkDotDockerignore inspects whether a .dockerignore exists next to the Dockerfile
 // and suggests common ignores if missing.
@@ -330,7 +409,7 @@ func checkDotDockerignore(dfPath string) []finding {
 }
 
 func parseDockerignore(content string) []string {
-	var out []string                                 // Collected patterns.
+	var out []string                                   // Collected patterns.
 	sc := bufio.NewScanner(strings.NewReader(content)) // Scanner over file content.
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text()) // Trim spaces for robustness.
