@@ -1,11 +1,43 @@
-# Docksleek
+Dockerfile Linter and Image Layer Analyzer
 
-I finished the bare CLI that should work with most CI/CD systems.
+This tool provides Dockerfile linting and optional Docker image layer analysis to help produce smaller, more secure, and more reproducible images.
 
-## Next Steps
+Features
 
-In the next steps, I plan to:
-- Add an automated movement function to reoriganize and redo commands. May o may not be heuristic based.
-- Add more detailed logging and error handling.
+Dockerfile linting with line-scoped suggestions
 
-Not entirely sure what else I can add. Maybe after I finish I can add a quick demo and see if it maybe will help for specific workflows. But in all, happy to get started with Go!
+Detects common issues: unpinned images, misuse of ADD, inefficient apt usage, missing .dockerignore, supply-chain risks, missing non-root user, missing HEALTHCHECK, and more
+
+Docker image layer analyzer that reports the top three largest layers
+
+Install
+git clone https://github.com/<your-org>/<your-repo>.git
+cd <your-repo>
+go build -o docksleek
+
+Usage
+Lint a Dockerfile
+./docksleek -dockerfile Dockerfile
+
+
+Strict mode (exit non-zero if suggestions are found):
+
+./docksleek -dockerfile Dockerfile --strict
+
+Analyze Docker Image Layers
+
+Requires Docker running.
+
+./docksleek -image myimage:latest
+
+
+Shows the three largest layers with size, timestamps, and creation commands.
+
+Run Both
+./docksleek -dockerfile Dockerfile -image myimage:latest
+
+Flags
+Flag	Description
+-dockerfile <path>	Path to Dockerfile (default: Dockerfile)
+-image <name>	Docker image to analyze (optional)
+-strict	Exit with non-zero status if any suggestions are found
